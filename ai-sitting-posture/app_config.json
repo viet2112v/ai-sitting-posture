@@ -1,0 +1,8 @@
+{
+  "bad_posture_threshold_sec": 300,
+  "alert_cooldown_sec": 60,
+  "speaker_enabled": true,
+  "vibrate_enabled": true,
+  "voice_enabled": true,
+  "notification_enabled": true
+}
