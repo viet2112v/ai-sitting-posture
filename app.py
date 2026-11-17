@@ -1,12 +1,13 @@
 import os
 import io
 import time
+import json
 import math as m
 import cv2
 import numpy as np
 import threading
 from datetime import datetime, timezone, timedelta
-from flask import Flask, Response, render_template, request, jsonify, send_file
+from flask import Flask, Response, render_template, request, jsonify, send_file, send_from_directory
 from PIL import Image, ImageDraw, ImageFont
 from gtts import gTTS
 import requests
@@ -31,6 +32,41 @@ pose = mp_pose.Pose(
 
 # Khóa luồng (Thread Lock) để đồng bộ dữ liệu
 data_lock = threading.Lock()
+
+# ================= CẤU HÌNH HỆ THỐNG & TẦN SUẤT CẢNH BÁO =================
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "app_config.json")
+
+default_settings = {
+    "bad_posture_threshold_sec": 300,  # Mặc định 5 phút (300 giây) sai liên tục mới cảnh báo
+    "alert_cooldown_sec": 60,          # Nhắc lại sau mỗi 60 giây nếu chưa sửa tư thế
+    "speaker_enabled": True,           # Cho phép còi loa ESP32 kêu
+    "vibrate_enabled": True,           # Rung điện thoại
+    "voice_enabled": True,             # Giọng nói TTS
+    "notification_enabled": True       # Thông báo đẩy
+}
+
+def load_system_settings():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                cfg = dict(default_settings)
+                cfg.update(saved)
+                return cfg
+        except Exception as e:
+            print(f"[CONFIG] Lỗi đọc app_config.json: {e}")
+    return dict(default_settings)
+
+def save_system_settings(settings_dict):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings_dict, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"[CONFIG] Lỗi ghi app_config.json: {e}")
+        return False
+
+system_settings = load_system_settings()
 
 # Biến lưu trữ khung hình mới nhất để phát qua /video_feed
 latest_processed_frame = None
@@ -219,6 +255,9 @@ def upload_frame():
     should_alert = False
     color = green
     camera_view_label = "Chưa xác định"
+    head_forward_offset = 0
+    hip_visible = False
+    view_type = "UNKNOWN"
 
     if results.pose_landmarks:
         lm = results.pose_landmarks.landmark
@@ -325,9 +364,14 @@ def upload_frame():
             good_start_time = None
             posture_time = int(now - bad_start_time)
 
-            if posture_time >= 5: # Sai liên tục >= 5 giây -> báo động
-                should_alert = True
-                last_alert_triggered_time = now
+            thresh_sec = system_settings.get("bad_posture_threshold_sec", 300)
+            cooldown_sec = system_settings.get("alert_cooldown_sec", 60)
+
+            # Chỉ cảnh báo khi ngồi sai liên tục đủ thời gian ngưỡng (ví dụ: 5 phút = 300s)
+            if posture_time >= thresh_sec:
+                if (now - last_alert_triggered_time) >= cooldown_sec:
+                    should_alert = True
+                    last_alert_triggered_time = now
 
         # 4. Vẽ khung xương MediaPipe
         connections = [
@@ -377,6 +421,29 @@ def upload_frame():
     ret, jpeg_buffer = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     frame_bytes = jpeg_buffer.tobytes()
 
+    thresh_sec = system_settings.get("bad_posture_threshold_sec", 300)
+    cooldown_sec = system_settings.get("alert_cooldown_sec", 60)
+    speaker_enabled = system_settings.get("speaker_enabled", True)
+    speaker_should_alert = should_alert and speaker_enabled
+
+    # Phân loại âm thanh cảnh báo theo 4 file MP3 trong templates/
+    # Track 1 (001.mp3): Cúi gập cổ quá sâu
+    # Track 2 (002.mp3): Gù lưng / thân trên đổ gập ra trước
+    # Track 3 (003.mp3): Sai tư thế phối hợp (đồng thời cả cổ và lưng)
+    # Track 4 (004.mp3): Lệch vai / nghiêng vẹo cột sống hoặc cảnh báo khác
+    alert_track = 1
+    has_bad_neck = (neck_angle >= 32) or (view_type == "FRONT" and neck_angle >= 14)
+    has_bad_torso = (torso_angle >= 18) or (not hip_visible and head_forward_offset > 55)
+
+    if has_bad_neck and has_bad_torso:
+        alert_track = 3  # Phối hợp cả cổ và lưng
+    elif has_bad_torso:
+        alert_track = 2  # Gù lưng
+    elif has_bad_neck:
+        alert_track = 1  # Cúi cổ
+    else:
+        alert_track = 4  # Sai tư thế khác (lệch vai, nghiêng đầu...)
+
     with data_lock:
         latest_processed_frame = frame_bytes
         status_data = {
@@ -389,17 +456,27 @@ def upload_frame():
             "bad_posture_time": posture_time if posture_status == "Sai tư thế" else 0,
             "error_message": error_msg.strip(),
             "alert": should_alert,
+            "speaker_alert": speaker_should_alert,
+            "track": alert_track,
+            "bad_posture_threshold_sec": thresh_sec,
+            "alert_cooldown_sec": cooldown_sec,
+            "speaker_enabled": speaker_enabled,
             "last_update": now,
             "is_connected": True
         }
 
     return jsonify({
         "status": posture_status,
+        "error_msg": error_msg.strip(),
         "camera_view": camera_view_label,
         "neck_angle": neck_angle,
         "torso_angle": torso_angle,
-        "alert": should_alert,
-        "posture_time": posture_time
+        "alert": speaker_should_alert,  # ESP32 chỉ phát loa khi còi bật
+        "track": alert_track,           # Số thứ tự bài âm thanh (1, 2, 3, 4)
+        "app_alert": should_alert,
+        "posture_time": posture_time,
+        "bad_posture_threshold_sec": thresh_sec,
+        "alert_cooldown_sec": cooldown_sec
     }), 200
 
 def generate_mjpeg_stream():
@@ -444,6 +521,43 @@ def api_tts():
         return send_file(fp, mimetype="audio/mpeg")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    global system_settings
+    if request.method == 'POST':
+        try:
+            data = request.get_json(silent=True) or request.form.to_dict()
+            with data_lock:
+                if "bad_posture_threshold_sec" in data:
+                    system_settings["bad_posture_threshold_sec"] = int(data["bad_posture_threshold_sec"])
+                if "alert_cooldown_sec" in data:
+                    system_settings["alert_cooldown_sec"] = int(data["alert_cooldown_sec"])
+                if "speaker_enabled" in data:
+                    val = data["speaker_enabled"]
+                    system_settings["speaker_enabled"] = val in [True, "true", "True", 1, "1"]
+                if "vibrate_enabled" in data:
+                    val = data["vibrate_enabled"]
+                    system_settings["vibrate_enabled"] = val in [True, "true", "True", 1, "1"]
+                if "voice_enabled" in data:
+                    val = data["voice_enabled"]
+                    system_settings["voice_enabled"] = val in [True, "true", "True", 1, "1"]
+                if "notification_enabled" in data:
+                    val = data["notification_enabled"]
+                    system_settings["notification_enabled"] = val in [True, "true", "True", 1, "1"]
+                save_system_settings(system_settings)
+            return jsonify({"success": True, "settings": system_settings}), 200
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+    else:
+        with data_lock:
+            return jsonify(system_settings), 200
+
+@app.route('/audio/<filename>')
+def serve_template_audio(filename):
+    """Phục vụ trực tiếp các file âm thanh (001.mp3 - 004.mp3) từ thư mục templates/"""
+    templates_dir = os.path.join(os.path.dirname(__file__), "templates")
+    return send_from_directory(templates_dir, filename)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
